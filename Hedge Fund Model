@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC, LinearSVC, NuSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn import preprocessing
+from collections import Counter
+
+
+def initialize(context):
+    
+    add_history(50, '1d', 'price')
+    add_history(200, '1d', 'price')
+    context.picks = None
+    context.fundamental_dict = {}
+    context.fundamental_data = None 
+    context.gap = [(365/4)*i for i in range(1,5)]
+    
+    context.historical_bars = 100
+    context.feature_window = 10
+    
+    
+    # max position hold
+    context.hold_max = 50        
+    context.captial_requirement = 500000000
+    
+    # Used to track the purchase dates of each security
+    context.entry_dates = {}
+    
+
+    context.hold_days = {
+        'win': timedelta(days=375),
+        'loss': timedelta(days=345)
+    }
+    
+    
+    # Buy Stocks at the end of each week
+    schedule_function(func=beat_market,
+                      time_rule=time_rules.market_open(),
+                      date_rule=date_rules.week_end())
+    
+    schedule_function(func=rebalance, 
+                      time_rule=time_rules.market_open(),
+                      date_rule=date_rules.week_start())
+ 
+
+def before_trading_start(context): 
+
+    fundamental_df = get_fundamentals(
+        query(
+            fundamentals.company_reference.sid,
+            fundamentals.income_statement.ebit,
+            fundamentals.balance_sheet.total_assets,
+            fundamentals.balance_sheet.current_assets,
+            fundamentals.balance_sheet.current_liabilities,
+            fundamentals.balance_sheet.goodwill_and_other_intangible_assets,
+            fundamentals.valuation.enterprise_value,
+            fundamentals.valuation_ratios.pb_ratio,
+            fundamentals.valuation.market_cap            
+        )
+        .filter(fundamentals.valuation.market_cap > context.captial_requirement)
+        .filter(fundamentals.company_reference.sid != 103)
+        .filter(fundamentals.company_reference.sid != 207)
+        .order_by(fundamentals.valuation.market_cap.desc())       
+    )
+
+    fundamental_df = fundamental_df.dropna(axis=1)
+    
+    context.fundamental_df = fundamental_df
+    
+    #: On the first of every month
+    if get_datetime().day == 1:
+        context.fundamental_dict[get_datetime()] = context.fundamental_df
+        context.fundamental_data = pd.Panel(context.fundamental_dict)
+        picks = hist_ranks(context)
+        #: If it's not yet time to order, fill context.fundamental_df with an empty list
+        if picks is None:
+            context.picks = None
+        else:
+            context.picks = list(picks.index)
+
+    if context.picks is None:
+        universe = context.fundamental_df.columns.values[:400]
+    else:
+        universe = context.picks
+        
+    update_universe(universe)
+    
+def beat_market(context, data):
+    # check if have room to get position
+    stocks_owned = sum(1 for stock in data 
+               if context.portfolio.positions[stock].amount > 0)
+    now = get_datetime()
+    
+    short_p = history(50, '1d', 'price').mean()
+    long_p= history(200, '1d', 'price').mean()
+    
+    if context.picks is None:
+        return
+    
+    for stock in context.picks:
+
+        if stock not in data:
+            continue
+    
+        if  stocks_owned >= context.hold_max:
+            return None
+        #Skip stocks already owned
+        if context.portfolio.positions[stock].amount :
+            continue
+       
+        
+        try:
+            order_target_percent(stock, 1 /context.hold_max)
+            context.entry_dates[stock] = now
+            start_bar = context.feature_window
+            price_list = prices[stock].tolist()
+
+            X = []
+            y = []
+
+            bar = start_bar
+
+            # feature creation
+            while bar < len(price_list)-1:
+                try:
+                    end_price = price_list[bar+1]
+                    begin_price = price_list[bar]
+
+                    pricing_list = []
+                    xx = 0
+                    for _ in range(context.feature_window):
+                        price = price_list[bar-(context.feature_window-xx)]
+                        pricing_list.append(price)
+                        xx += 1
+
+                    features = np.around(np.diff(pricing_list) / pricing_list[:-1] * 100.0, 1)
+
+
+                    #print(features)
+
+                    if end_price > begin_price:
+                        label = 1
+                    else:
+                        label = -1
+
+                    bar += 1
+                    X.append(features)
+                    y.append(label)
+
+                except Exception as e:
+                    bar += 1
+                    print(('feature creation',str(e)))
+
+
+
+
+            clf1 = RandomForestClassifier()
+            clf2 = LinearSVC()
+            clf3 = NuSVC()
+            clf4 = LogisticRegression()
+
+            last_prices = price_list[-context.feature_window:]
+            current_features = np.around(np.diff(last_prices) / last_prices[:-1] * 100.0, 1)
+
+            X.append(current_features)
+            X = preprocessing.scale(X)
+
+            current_features = X[-1]
+            X = X[:-1]
+
+            clf1.fit(X,y)
+            clf2.fit(X,y)
+            clf3.fit(X,y)
+            clf4.fit(X,y)
+
+            p1 = clf1.predict(current_features)[0]
+            p2 = clf2.predict(current_features)[0]
+            p3 = clf3.predict(current_features)[0]4
+            
+            
+            if Counter([p1,p2,p3,p4]).most_common(1)[0][1] >= 4:
+                t = Counter([p1,p2,p3,p4]).most_common(1)[0][0]
+                
+            else:
+                t = 0
+                
+            print(('Prediction',p))
+
+
+           
+
+        except Exception as e:
+            print(str(e))  
+            stocks_owned += 1
+            if t == 1 and short_p[stock] < long_p[stock]:
+                order_target_percent(stock, 0)
+                stocks_owned -= 1
+            elif t == -1 and short_p[stock] > long_p[stock]:
+                order_target_percent(stock, 1/ context.hold_max)     
+                stocks_owned += 1
+        except Exception as e:
+            print e
+        
+            
+def rebalance(context, data):
+    now = get_datetime()
+    for stock in data:
+        cost_basis = context.portfolio.positions[stock].cost_basis
+        if cost_basis:
+            returns = data[stock].price / cost_basis - 1
+            if returns >= 0:
+                entry_date = context.entry_dates[stock]
+                if now >= entry_date + context.hold_days['win']:
+                    order_target(stock, 0)
+            elif returns < 0:
+                entry_date = context.entry_dates[stock]
+                if now >= entry_date + context.hold_days['loss']:
+                    order_target(stock, 0)
+
+
+def hist_ranks(context):
+  
+    #: Instantiate a few variables that we need
+    his_panel = {}
+    fund_hist = context.fundamental_data
+    gap = context.gap
+    
+    
+    earliest_date = get_datetime() - timedelta(max(gap))
+    if earliest_date < min(fund_hist.items):
+        return None
+     
+
+    for t in gap:
+        
+        d=get_datetime() - timedelta(t)
+        d_index = fund_hist.items.searchsorted(d)
+        date = fund_hist.items[d_index]
+        hist_df = fund_hist[date]
+
+
+        EY_ranks = hist_df.ix['ebit'] /hist_df.ix['enterprise_value']
+        RC_ranks = hist_df.ix['ebit']/(hist_df.ix['total_assets']-hist_df.ix['current_liabilities']-hist_df.ix['goodwill_and_other_intangible_assets'])
+        PB_ranks = hist_df.ix['pb_ratio']
+
+        #:Sort by descending
+        #earning yeilds ranks sort
+        EY_ranks.sort(ascending=False)
+        #return on capital yeilds ranks sort
+        RC_ranks.sort(ascending=False)
+        #price to book rank sort
+        PB_ranks.sort(ascending=False)
+
+        #Add rank by index
+        EY_ranks = pd.Series(range(len(EY_ranks)), index=EY_ranks.index)
+        RC_ranks = pd.Series(range(len(RC_ranks)), index=RC_ranks.index)
+        PB_ranks = pd.Series(range(len(PB_ranks )),index=PB_ranks.index)
+
+        ranks = EY_ranks + RC_ranks + PB_ranks
+        his_panel[t] = ranks
+        
+
+    total_rank = pd.DataFrame(his_panel).mean(1)    
+    
+    #: take top 50 ranked stocks
+    total_rank.sort(ascending=True)
+    return total_rank.head(context.hold_max)
+
+
+        
+def handle_data(context, data):
+
+    record(leverage=context.account.leverage,
+           stocks_owned=sum(1 for stock in data 
+               if context.portfolio.positions[stock].amount > 0))
